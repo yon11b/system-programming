@@ -4,7 +4,7 @@
 #include <sys/ipc.h>
 #include <sys/msg.h>
 #include <sys/wait.h>
-#include <time.h>
+#include <sys/time.h>   // gettimeofday
 
 #define ROWS 64
 #define COLS 64
@@ -20,18 +20,17 @@ struct msgbuf {
     int data[CHUNK];       // 실제 int 데이터
 };
 
-// 시간 측정 함수
+// 시간 측정 함수 (gettimeofday 사용)
 double now_sec() {
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return t.tv_sec + t.tv_nsec/1e9;
+    struct timeval t;
+    gettimeofday(&t, NULL);
+    return t.tv_sec + t.tv_usec/1e6;
 }
 
 int main() {
     int qids[SERVER_COUNT];
 
     // 1. 서버별 메시지 큐 생성
-    // ftok로 키 생성 → msgget으로 큐 생성
     for(int s=0;s<SERVER_COUNT;s++)
         qids[s]=msgget(1574,IPC_CREAT|0666);
 
@@ -73,16 +72,6 @@ int main() {
     // 3. 클라이언트 프로세스 생성
     for(int c=0;c<SM_COUNT;c++){
         if(fork()==0){
-            /*
-                start: 0    / end: 512
-                start: 512  / end: 1024
-                start: 1024 / end: 1536
-                start: 1536 / end: 2048
-                start: 2048 / end: 2560
-                start: 2560 / end: 3072
-                start: 3072 / end: 3584
-                start: 3584 / end: 4096
-            */
             int start=c*(N/SM_COUNT), end=start+(N/SM_COUNT); // 클라이언트가 담당할 데이터 범위
             int *bufs[SERVER_COUNT];       // 서버별 임시 버퍼
             int counts[SERVER_COUNT]={0};  // 각 서버별 데이터 개수
@@ -137,7 +126,6 @@ int main() {
     for(int c=0;c<SM_COUNT;c++) wait(NULL);
 
     // 5. 서버 종료 신호 전송 (count=0)
-    // 서버는 count=0 메시지를 받으면 루프 종료
     for(int s=0;s<SERVER_COUNT;s++){
         struct msgbuf msg={1,0,{0}};
         msgsnd(qids[s],&msg,sizeof(msg.count),0);
