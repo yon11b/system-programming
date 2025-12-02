@@ -72,6 +72,16 @@ int main() {
     // 3. 클라이언트 프로세스 생성
     for(int c=0;c<SM_COUNT;c++){
         if(fork()==0){
+            /*
+                start: 0    / end: 512
+                start: 512  / end: 1024
+                start: 1024 / end: 1536
+                start: 1536 / end: 2048
+                start: 2048 / end: 2560
+                start: 2560 / end: 3072
+                start: 3072 / end: 3584
+                start: 3584 / end: 4096
+            */
             int start=c*(N/SM_COUNT), end=start+(N/SM_COUNT); // 클라이언트가 담당할 데이터 범위
             int *bufs[SERVER_COUNT];       // 서버별 임시 버퍼
             int counts[SERVER_COUNT]={0};  // 각 서버별 데이터 개수
