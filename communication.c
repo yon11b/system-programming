@@ -81,15 +81,14 @@ static void client_process_shm(int cid, int initial_shmid, int domain_shmid, int
 
     fill_initial_data(cid, initial);
 
+    // 초기 데이터 바이너리 기록
     snprintf(fname, sizeof(fname), "client%d_dist.dat", cid);
-    fp = fopen(fname, "w");
+    fp = fopen(fname, "wb");
     if (!fp) {
         perror("fopen dist");
         exit(1);
     }
-    for (i = 0; i < LOCAL_CHUNK; i++) {
-        fprintf(fp, "%d\n", initial[i]);
-    }
+    fwrite(initial, sizeof(int), LOCAL_CHUNK, fp);
     fclose(fp);
 
     int* my_initial_ptr = shm_initial + (cid * LOCAL_CHUNK);
@@ -108,15 +107,14 @@ static void client_process_shm(int cid, int initial_shmid, int domain_shmid, int
     int* my_domain_ptr = shm_domain + (cid * DOMAIN_SIZE);
     memcpy(domain, my_domain_ptr, sizeof(domain));
 
+    // Domain 데이터 바이너리 기록
     snprintf(fname, sizeof(fname), "client%d.dat", cid);
-    fp = fopen(fname, "w");
+    fp = fopen(fname, "wb");
     if (!fp) {
         perror("fopen client.dat");
         exit(1);
     }
-    for (i = 0; i < DOMAIN_SIZE; i++) {
-        fprintf(fp, "%d\n", domain[i]);
-    }
+    fwrite(domain, sizeof(int), DOMAIN_SIZE, fp);
     fclose(fp);
 
     int sendbuf[C2S_BLOCK_INTS];
