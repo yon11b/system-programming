@@ -25,7 +25,7 @@
 
 // 메시지 큐 관련
 #define SERVER_COUNT 4
-#define CHUNK 256
+#define CHUNK 512
 
 struct msgbuf {
     long mtype;
@@ -288,15 +288,21 @@ int main(void) {
         domain_count[i] = 0;
     }
 
-    for (i = 0; i < TOTAL_DATA; i++) {
-        int v = shm_initial[i];
-        int owner = v / DOMAIN_SIZE;
-        int idx = domain_count[owner]++;
-        if (idx >= DOMAIN_SIZE) {
-            fprintf(stderr, "domain overflow for client %d\n", owner);
-            exit(1);
+    // for (i = 0; i < TOTAL_DATA; i++) {
+    //     int v = shm_initial[i];
+    //     int owner = v / DOMAIN_SIZE;
+    //     int idx = domain_count[owner]++;
+    //     if (idx >= DOMAIN_SIZE) {
+    //         fprintf(stderr, "domain overflow for client %d\n", owner);
+    //         exit(1);
+    //     }
+    //     temp_domain[owner][idx] = v;
+    // }
+    // 연속된 숫자로 도메인 재배치
+    for (i = 0; i < N_CLIENT; i++) {
+        for (int j = 0; j < DOMAIN_SIZE; j++) {
+            temp_domain[i][j] = i * DOMAIN_SIZE + j;  // 0~511, 512~1023, ...
         }
-        temp_domain[owner][idx] = v;
     }
 
     for (i = 0; i < N_CLIENT; i++) {
