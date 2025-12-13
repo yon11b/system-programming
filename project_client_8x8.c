@@ -13,6 +13,21 @@
 #define DATA_SIZE (N * N)      /* 4096 */
 #define SM_CHUNK (DATA_SIZE / NUM_SM)  /* 512 */
 
+// server에 msgsnd 보내는 부분 추가
+#include <sys/msg.h>
+
+#define MSG_KEY 0x1234
+#define CHUNK_INT 256
+
+struct msgbuf {
+    long mtype;              // client id (1~8)
+    // int  chunk_idx;          // 0 or 1
+    int  data[CHUNK_INT];    // 1KB
+};
+
+
+
+
 /* 시간 차이를 초(double) 단위로 반환하는 매크로 */
 #define GET_DURATION(start, end) \
     ((end.tv_sec - start.tv_sec) + (end.tv_usec - start.tv_usec) / 1000000.0)
@@ -185,6 +200,8 @@ int main() {
             FILE *fp_ord;
             struct timeval sm_start2, sm_end2;
             double sm_time2;
+            int msqid;
+            struct msgbuf msg;
 
             global_start = sm * SM_CHUNK;   /* 0, 512, 1024, ... */
             ord_buffer = (int *)malloc(sizeof(int) * SM_CHUNK);
@@ -192,6 +209,12 @@ int main() {
                 perror("malloc ord_buffer failed");
                 exit(1);
             }
+            msqid = msgget(MSG_KEY, IPC_CREAT | 0666);
+            if (msqid == -1) {
+                perror("msgget failed (client)");
+                exit(1);
+            }
+
 
             gettimeofday(&sm_start2, NULL);
 
@@ -212,7 +235,31 @@ int main() {
 
             gettimeofday(&sm_end2, NULL);
             sm_time2 = GET_DURATION(sm_start2, sm_end2);
+            msg.mtype = sm + 1;
 
+            /* ===================== 첫 번째 256개 ===================== */
+            // msg.chunk_idx = 0; // 첫번째 chunk 표시
+            memcpy(msg.data, &ord_buffer[0], sizeof(int) * CHUNK_INT);
+
+            if (msgsnd(msqid, &msg, sizeof(msg.data), 0) == -1) {
+                perror("msgsnd failed (1st chunk)");
+                exit(1);
+            }
+
+            printf("[CLIENT][SM %d] chunk 1 전송 (global %d~%d)\n",
+                sm, global_start, global_start + 255);
+
+            /* ===================== 두 번째 256개 ===================== */            
+            // msg.chunk_idx = 1; // 두번째 chunk 표시
+            memcpy(msg.data, &ord_buffer[CHUNK_INT], sizeof(int) * CHUNK_INT);
+
+            if (msgsnd(msqid, &msg, sizeof(msg.data), 0) == -1) {
+                perror("msgsnd failed (2nd chunk)");
+                exit(1);
+            }
+
+            printf("[CLIENT][SM %d] chunk 2 전송 (global %d~%d)\n",
+                sm, global_start + 256, global_start + 511);
             /* 정렬된 연속 데이터 파일 저장 */
             sprintf(filename, "ord_sm_%d.bin", sm);
             fp_ord = fopen(filename, "wb");
