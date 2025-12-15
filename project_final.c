@@ -87,7 +87,7 @@ void server_run() {
 
     struct timeval c2s_s, c2s_e, io_s, io_e;
     double c2s_time = 0, io_time = 0;
-
+    gettimeofday(&io_s, NULL);
     for (int i = 0; i < total_msgs; i++) {
         gettimeofday(&c2s_s, NULL);
         if (msgrcv(msqid, &msg, sizeof(msg.data), 0, 0) == -1) {
@@ -100,15 +100,25 @@ void server_run() {
         int sm = (int)msg.mtype - 1;   // 0~7
         int disk = sm % 4;
 
-        gettimeofday(&io_s, NULL);
-        fwrite(msg.data, sizeof(int), CHUNK_INT, raid[disk]);
-        fflush(raid[disk]);
-        gettimeofday(&io_e, NULL);
-        io_time += GET_DURATION(io_s, io_e);
+        pid_t pid = fork();
+        if (pid == 0) {  // 자식 프로세스: 디스크 쓰기 담당            
+            fwrite(msg.data, sizeof(int), CHUNK_INT, raid[disk]);
+            fflush(raid[disk]);
+            //gettimeofday(&io_e, NULL);
+            // double middle_duration = GET_DURATION(io_s, io_e);
+            // printf("[SERVER %d] IO time %.6f sec\n", disk, middle_duration);
+            exit(0);
+        }
+        // 부모는 계속 다음 메시지 처리
     }
-
+    // 모든 자식 프로세스 종료 대기
+    while (wait(NULL) > 0);
     printf("\n[SERVER] client->server time = %.6f sec\n", c2s_time);
-    printf("[SERVER] IO time = %.6f sec\n", io_time);
+    gettimeofday(&io_e, NULL);
+    double duration = GET_DURATION(io_s, io_e);
+    printf("[SERVER] IO time %.6f sec\n", duration);
+
+    //printf("[SERVER] IO time = %.6f sec\n", io_time);
 
     for (int i = 0; i < 4; i++) fclose(raid[i]);
     msgctl(msqid, IPC_RMID, NULL);
