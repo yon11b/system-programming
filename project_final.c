@@ -55,74 +55,135 @@ void sem_unlock(int id){
     }
 }
 
+// /* ===================== SERVER ===================== */
+// void server_run() {
+//     int msqid = msgget(MSG_KEY, IPC_CREAT | 0666);
+//     if (msqid == -1) {
+//         perror("msgget(server)");
+//         exit(1);
+//     }
+
+//     struct msgbuf msg;
+
+//     FILE* raid[4];
+//     char fn[32];
+
+//     for (int i = 0; i < 4; i++) {
+//         sprintf(fn, "raid_disk%d.bin", i);
+//         raid[i] = fopen(fn, "wb");
+//         if (!raid[i]) {
+//             perror("fopen raid_disk");
+//             exit(1);
+//         }
+//     }
+
+//     int total_msgs;
+
+// #if defined(GRID_8x8)
+//     total_msgs = NUM_SM * 2;        // 8 * 2 = 16
+// #elif defined(GRID_4x4)
+//     total_msgs = LOGICAL_SM * 2;    // 8 * 2 = 16
+// #endif
+    
+//     /* 3. 자식 프로세스 4개 생성 (디스크별) */
+//     pid_t disk_pid[4];
+//     for (int d = 0; d < 4; d++) {
+//         disk_pid[d] = fork();
+//         if (disk_pid[d] == 0) {  // 자식 프로세스
+//             /* 각자 자신의 파일 열기 (append 모드) */
+//             char fn[32];
+//             sprintf(fn, "raid_disk%d.bin", d);
+//             FILE *fp = fopen(fn, "ab");
+//             if (!fp) { perror("fopen child"); exit(1); }
+
+//             struct msgbuf msg;
+//             struct timeval io_s, io_e;
+//             double c2s_time = 0;                
+//             printf("[DEBUG] Disk %d waiting for mtype %d\n", d, d+1);
+
+
+//             while (1) {
+//                 /* 메시지 수신 (mtype = d+1) */
+//                 struct timeval recv_s, recv_e;
+//                 gettimeofday(&recv_s, NULL);
+//                 int ret = msgrcv(msqid, &msg, sizeof(msg.data), d + 1, 0);
+
+//                 gettimeofday(&recv_e, NULL);
+//                 if (ret == -1) {
+//                     perror("msgrcv child");
+//                     break;
+//                 }
+//                 c2s_time += GET_DURATION(recv_s, recv_e);
+//                 printf("[Disk %d] client->server time %.6f sec\n", d, c2s_time);
+
+//                 /* 파일 쓰기 */
+//                 gettimeofday(&io_s, NULL);
+//                 fwrite(msg.data, sizeof(int), CHUNK_INT, fp);
+//                 fflush(fp);
+//                 gettimeofday(&io_e, NULL);
+//                 printf("[Disk %d] wrote chunk in %.6f sec\n", d, GET_DURATION(io_s, io_e));
+//             }
+
+//             fclose(fp);
+//             exit(0);
+//         }
+//     }
+//     msgctl(msqid, IPC_RMID, NULL);
+// }
 /* ===================== SERVER ===================== */
 void server_run() {
     int msqid = msgget(MSG_KEY, IPC_CREAT | 0666);
-    if (msqid == -1) {
-        perror("msgget(server)");
-        exit(1);
-    }
+    if (msqid == -1) { perror("msgget"); exit(1); }
 
-    struct msgbuf msg;
+    pid_t disk_pid[4];
+    int msgs_per_disk = 4;
 
-    FILE* raid[4];
-    char fn[32];
+    for (int d = 0; d < 4; d++) {
+        disk_pid[d] = fork();
+        if (disk_pid[d] == 0) {
+            char fn[32];
+            sprintf(fn, "raid_disk%d.bin", d);
+            FILE *fp = fopen(fn, "wb");
+            if (!fp) { perror("fopen"); exit(1); }
 
-    for (int i = 0; i < 4; i++) {
-        sprintf(fn, "raid_disk%d.bin", i);
-        raid[i] = fopen(fn, "wb");
-        if (!raid[i]) {
-            perror("fopen raid_disk");
-            exit(1);
-        }
-    }
-
-    int total_msgs;
-
-#if defined(GRID_8x8)
-    total_msgs = NUM_SM * 2;        // 8 * 2 = 16
-#elif defined(GRID_4x4)
-    total_msgs = LOGICAL_SM * 2;    // 8 * 2 = 16
-#endif
-
-    struct timeval c2s_s, c2s_e, io_s, io_e;
-    double c2s_time = 0, io_time = 0;
-    gettimeofday(&io_s, NULL);
-    for (int i = 0; i < total_msgs; i++) {
-        gettimeofday(&c2s_s, NULL);
-        if (msgrcv(msqid, &msg, sizeof(msg.data), 0, 0) == -1) {
-            perror("msgrcv");
-            exit(1);
-        }
-        gettimeofday(&c2s_e, NULL);
-        c2s_time += GET_DURATION(c2s_s, c2s_e);
-
-        int sm = (int)msg.mtype - 1;   // 0~7
-        int disk = sm % 4;
-
-        pid_t pid = fork();
-        if (pid == 0) {  // 자식 프로세스: 디스크 쓰기 담당            
-            fwrite(msg.data, sizeof(int), CHUNK_INT, raid[disk]);
-            fflush(raid[disk]);
-            //gettimeofday(&io_e, NULL);
-            // double middle_duration = GET_DURATION(io_s, io_e);
-            // printf("[SERVER %d] IO time %.6f sec\n", disk, middle_duration);
+            struct msgbuf msg;
+            struct timeval recv_s, recv_e, io_s, io_e;
+            double total_c2s = 0, total_io = 0;
+            for (int i = 0; i < msgs_per_disk; i++) {
+                gettimeofday(&recv_s, NULL);
+                if (msgrcv(msqid, &msg, sizeof(msg.data), d+1, 0) == -1) {
+                    perror("msgrcv");
+                    break;
+                }
+                gettimeofday(&recv_e, NULL);
+                
+                double c2s_time = GET_DURATION(recv_s, recv_e);
+                total_c2s += c2s_time;
+                printf("[Disk %d] client->server time %.6f sec\n", d, c2s_time);
+                gettimeofday(&io_s, NULL);
+                fwrite(msg.data, sizeof(int), CHUNK_INT, fp);
+                fflush(fp);
+                gettimeofday(&io_e, NULL);
+                
+                double io_time = GET_DURATION(io_s, io_e);
+                total_io += io_time;
+                printf("[Disk %d] wrote chunk in %.6f sec\n", d, io_time);
+            }
+            printf("[Disk %d] total client->server time: %.6f sec, total io time: %.6f sec\n",
+                   d, total_c2s, total_io);
+            fclose(fp);
             exit(0);
         }
-        // 부모는 계속 다음 메시지 처리
     }
-    // 모든 자식 프로세스 종료 대기
-    while (wait(NULL) > 0);
-    printf("\n[SERVER] client->server time = %.6f sec\n", c2s_time);
-    gettimeofday(&io_e, NULL);
-    double duration = GET_DURATION(io_s, io_e);
-    printf("[SERVER] IO time %.6f sec\n", duration);
 
-    //printf("[SERVER] IO time = %.6f sec\n", io_time);
+    for (int i = 0; i < 4; i++) wait(NULL);
 
-    for (int i = 0; i < 4; i++) fclose(raid[i]);
-    msgctl(msqid, IPC_RMID, NULL);
-}
+    // 모든 child 종료 후 msg queue 제거
+    if (msgctl(msqid, IPC_RMID, NULL) == -1) {
+        perror("msgctl");
+    }
+} // <- server_run 끝
+
 
 /* =========================================================
  * make_dist_4x4
@@ -207,7 +268,7 @@ int main(){
 
     /* ===== server fork ===== */
     if(fork()==0){
-        server_run();
+        server_run(semid);
         exit(0);
     }
 
@@ -268,11 +329,16 @@ int main(){
             }
 
             /* server 전송: 256 ints * 2 chunks */
-            int msqid = msgget(MSG_KEY, 0666);
+            //int msqid = msgget(MSG_KEY, 0666);
+            int msqid = -1;
+            while ((msqid = msgget(MSG_KEY, 0666)) == -1) {
+                usleep(1000); // 1ms 대기
+            }
             if (msqid == -1) { perror("msgget(client)"); exit(1); }
 
             struct msgbuf msg;
-            msg.mtype = sm + 1;
+            // msg.mtype = sm + 1;
+            msg.mtype = (sm % 4) + 1;
 
             memcpy(msg.data, &ord_buf[0], sizeof(int)*CHUNK_INT);
             if (msgsnd(msqid, &msg, sizeof(msg.data), 0) == -1) {
@@ -353,9 +419,14 @@ int main(){
             fwrite(ord_buf, sizeof(int), LOGICAL_CHUNK, fo);
             fclose(fo);
 
-            int msqid = msgget(MSG_KEY, 0666);
+            // int msqid = msgget(MSG_KEY, 0666);
+            int msqid = -1;
+            while ((msqid = msgget(MSG_KEY, 0666)) == -1) {
+                usleep(1000); // 1ms 대기
+            }
             struct msgbuf msg;
-            msg.mtype = l + 1;
+            // msg.mtype = l + 1;
+            msg.mtype = (l % 4) + 1;
 
             memcpy(msg.data, &ord_buf[0], sizeof(int) * CHUNK_INT);
             msgsnd(msqid, &msg, sizeof(msg.data), 0);
