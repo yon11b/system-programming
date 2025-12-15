@@ -10,12 +10,13 @@
 #include <sys/sem.h>
 
 /* ===================== MODE ===================== */
+#define LOGICAL_SM 8
+
 #if defined(GRID_8x8)
 #define NUM_SM 8
 #elif defined(GRID_4x4)
 #define NUM_SM 4
-#define LOGICAL_SM 8
-#define LOGICAL_CHUNK (DATA_SIZE / LOGICAL_SM)   // 512
+#define LOGICAL_CHUNK (DATA_SIZE / LOGICAL_SM)   /* 512 */
 #else
 #error "Define GRID_8x8 or GRID_4x4"
 #endif
@@ -40,65 +41,49 @@ struct msgbuf {
 /* ===================== SEM ===================== */
 union semun { int val; };
 
-void sem_lock(int id){
-    struct sembuf p={0,-1,SEM_UNDO};
-    if (semop(id,&p,1) == -1) {
-        perror("semop lock");
-        exit(1);
-    }
+void sem_wait_s(int id) {
+    struct sembuf p = {0, -1, 0};
+    semop(id, &p, 1);
 }
-void sem_unlock(int id){
-    struct sembuf v={0,1,SEM_UNDO};
-    if (semop(id,&v,1) == -1) {
-        perror("semop unlock");
-        exit(1);
-    }
+
+void sem_post_s(int id) {
+    struct sembuf v = {0, 1, 0};
+    semop(id, &v, 1);
 }
 
 /* ===================== SERVER ===================== */
-void server_run() {
-    int msqid = msgget(MSG_KEY, IPC_CREAT | 0666);
-    if (msqid == -1) {
-        perror("msgget(server)");
-        exit(1);
-    }
-
+void server_run(double *server_times) {
+    int msqid;
     struct msgbuf msg;
-
     FILE* raid[4];
     char fn[32];
-
-    for (int i = 0; i < 4; i++) {
-        sprintf(fn, "raid_disk%d.bin", i);
-        raid[i] = fopen(fn, "wb");
-        if (!raid[i]) {
-            perror("fopen raid_disk");
-            exit(1);
-        }
-    }
-
+    int i;
     int total_msgs;
-
-#if defined(GRID_8x8)
-    total_msgs = NUM_SM * 2;        // 8 * 2 = 16
-#elif defined(GRID_4x4)
-    total_msgs = LOGICAL_SM * 2;    // 8 * 2 = 16
-#endif
-
     struct timeval c2s_s, c2s_e, io_s, io_e;
     double c2s_time = 0, io_time = 0;
+    int sm, disk;
+    
+    msqid = msgget(MSG_KEY, IPC_CREAT | 0666);
+    if (msqid == -1) { perror("msgget(server)"); exit(1); }
 
-    for (int i = 0; i < total_msgs; i++) {
+    for (i = 0; i < 4; i++) {
+        sprintf(fn, "raid_disk%d.bin", i);
+        raid[i] = fopen(fn, "wb");
+        if (!raid[i]) { perror("fopen raid_disk"); exit(1); }
+    }
+
+    total_msgs = LOGICAL_SM * 2;  /* 8 * 2 = 16 */
+
+    for (i = 0; i < total_msgs; i++) {
         gettimeofday(&c2s_s, NULL);
         if (msgrcv(msqid, &msg, sizeof(msg.data), 0, 0) == -1) {
-            perror("msgrcv");
-            exit(1);
+            perror("msgrcv"); exit(1);
         }
         gettimeofday(&c2s_e, NULL);
         c2s_time += GET_DURATION(c2s_s, c2s_e);
 
-        int sm = (int)msg.mtype - 1;   // 0~7
-        int disk = sm % 4;
+        sm = (int)msg.mtype - 1;
+        disk = sm % 4;
 
         gettimeofday(&io_s, NULL);
         fwrite(msg.data, sizeof(int), CHUNK_INT, raid[disk]);
@@ -107,297 +92,425 @@ void server_run() {
         io_time += GET_DURATION(io_s, io_e);
     }
 
-    printf("\n[SERVER] client->server time = %.6f sec\n", c2s_time);
-    printf("[SERVER] IO time = %.6f sec\n", io_time);
+    /* Store times to shared memory */
+    server_times[0] = c2s_time;
+    server_times[1] = io_time;
 
-    for (int i = 0; i < 4; i++) fclose(raid[i]);
+    for (i = 0; i < 4; i++) fclose(raid[i]);
     msgctl(msqid, IPC_RMID, NULL);
 }
 
-/* =========================================================
- * make_dist_4x4
- *  - logical_sm : 0 ~ 7
- *  - out        : 512 ints
- * ========================================================= */
-void make_dist_4x4(int logical_sm, int *out)
-{
-    const int TILE = 16;   // 16x16
+/* ===================== DIST FUNCTIONS ===================== */
+void make_dist_4x4(int logical_sm, int *out) {
+    const int TILE = 16;
     int idx = 0;
-
-    int tile_col = logical_sm % 4;   // 0~3
-    int tile_row = logical_sm / 4;   // 0 or 1
-
-    for (int repeat = 0; repeat < 2; repeat++) {
-        int base_tile_row = tile_row + repeat * 2;
-        int base_row = base_tile_row * TILE;
-
-        for (int r = base_row; r < base_row + TILE; r++) {
-            for (int c = tile_col * TILE; c < (tile_col + 1) * TILE; c++) {
+    int tile_col = logical_sm % 4;
+    int tile_row = logical_sm / 4;
+    int repeat, base_tile_row, base_row, r, c;
+    
+    for (repeat = 0; repeat < 2; repeat++) {
+        base_tile_row = tile_row + repeat * 2;
+        base_row = base_tile_row * TILE;
+        for (r = base_row; r < base_row + TILE; r++) {
+            for (c = tile_col * TILE; c < (tile_col + 1) * TILE; c++) {
                 out[idx++] = r * 64 + c;
             }
         }
     }
-
-    if (idx != 512) {
-        fprintf(stderr, "[ERROR] make_dist_4x4: sm=%d, idx=%d\n",
-                logical_sm, idx);
-        exit(1);
-    }
 }
 
-/* =========================================================
- * make_dist_8x8 (PPT 기준: 열 striping)
- *  - dist_sm_i.bin 저장(덤프용)
- *  - shared[sm*512..]에 dist를 기록 (client-client 통신용)
- * ========================================================= */
-void make_dist_8x8(int sm, int *shared, int semid)
-{
-    int cols_per_sm = N / 8;          // 8
+void make_dist_8x8(int sm, int *out) {
+    int cols_per_sm = N / 8;
     int start_col = sm * cols_per_sm;
-    int end_col   = start_col + cols_per_sm;
-
-    int buf[512];
+    int end_col = start_col + cols_per_sm;
     int idx = 0;
-
-    for (int r = 0; r < N; r++) {
-        for (int c = start_col; c < end_col; c++) {
-            buf[idx++] = r * N + c;  // global index
+    int r, c;
+    
+    for (r = 0; r < N; r++) {
+        for (c = start_col; c < end_col; c++) {
+            out[idx++] = r * N + c;
         }
     }
-
-    /* dist 파일 저장 (보여주기용) */
-    char fname[32];
-    sprintf(fname, "dist_sm_%d.bin", sm);
-    FILE *fp = fopen(fname, "wb");
-    if (!fp) { perror("fopen dist"); exit(1); }
-    fwrite(buf, sizeof(int), 512, fp);
-    fclose(fp);
-
-    /* shared memory에 dist 저장 (통신용) */
-    /* 구역이 겹치지 않지만, 과제 요구상 semaphore 사용 가능 */
-    sem_lock(semid);
-    memcpy(&shared[sm * 512], buf, sizeof(int) * 512);
-    sem_unlock(semid);
 }
 
 /* ===================== MAIN ===================== */
-int main(){
-    int shmid = shmget(IPC_PRIVATE,sizeof(int)*DATA_SIZE,IPC_CREAT|0666);
-    if (shmid == -1) { perror("shmget"); exit(1); }
-
-    int semid = semget(IPC_PRIVATE,1,IPC_CREAT|0666);
-    if (semid == -1) { perror("semget"); exit(1); }
-
+int main() {
+    int shmid, semid;
+    int *shared;
     union semun arg;
+    int i;
+    
+    /* Shared memory for server timing results */
+    int server_time_shmid;
+    double *server_times;
+    
+    /* Barrier semaphores */
+    int sem_ready, sem_go_cc, sem_done_cc, sem_go_cs, sem_done_cs;
+    int *counters;  /* [0]=ready, [1]=done_cc, [2]=done_cs */
+    int counter_shmid;
+    
+    struct timeval total_cc_s, total_cc_e, total_cs_s, total_cs_e;
+    
+    /* Create shared memory */
+    shmid = shmget(IPC_PRIVATE, sizeof(int) * DATA_SIZE, IPC_CREAT | 0666);
+    shared = shmat(shmid, NULL, 0);
+    
+    server_time_shmid = shmget(IPC_PRIVATE, sizeof(double) * 2, IPC_CREAT | 0666);
+    server_times = shmat(server_time_shmid, NULL, 0);
+    
+    counter_shmid = shmget(IPC_PRIVATE, sizeof(int) * 3, IPC_CREAT | 0666);
+    counters = shmat(counter_shmid, NULL, 0);
+    counters[0] = counters[1] = counters[2] = 0;
+    
+    /* Semaphores */
+    semid = semget(IPC_PRIVATE, 1, IPC_CREAT | 0666);
+    sem_ready = semget(IPC_PRIVATE, 1, IPC_CREAT | 0666);
+    sem_go_cc = semget(IPC_PRIVATE, 1, IPC_CREAT | 0666);
+    sem_done_cc = semget(IPC_PRIVATE, 1, IPC_CREAT | 0666);
+    sem_go_cs = semget(IPC_PRIVATE, 1, IPC_CREAT | 0666);
+    sem_done_cs = semget(IPC_PRIVATE, 1, IPC_CREAT | 0666);
+    
     arg.val = 1;
-    if (semctl(semid,0,SETVAL,arg) == -1) { perror("semctl"); exit(1); }
-
-    int* shared = shmat(shmid,NULL,0);
-    if (shared == (void*)-1) { perror("shmat"); exit(1); }
-
-    /* ===== server fork ===== */
-    if(fork()==0){
-        server_run();
+    semctl(semid, 0, SETVAL, arg);
+    semctl(sem_ready, 0, SETVAL, arg);
+    semctl(sem_done_cc, 0, SETVAL, arg);
+    semctl(sem_done_cs, 0, SETVAL, arg);
+    
+    arg.val = 0;
+    semctl(sem_go_cc, 0, SETVAL, arg);
+    semctl(sem_go_cs, 0, SETVAL, arg);
+    
+    /* Fork server */
+    if (fork() == 0) {
+        server_run(server_times);
         exit(0);
     }
-
-    struct timeval cc_s,cc_e;
-    gettimeofday(&cc_s,NULL);
+    
+    usleep(10000);
 
 #if defined(GRID_8x8)
-
-    /* =====================================================
-     * GRID_8x8 정답 흐름
-     *  Phase1: dist 생성 (shared에 dist 기록)
-     *  Phase2: shared(dist) 읽어서 ord 재정렬 + server 전송
-     * ===================================================== */
-
-    /* ---------- Phase 1: dist 생성 ---------- */
-    printf("=== [GRID_8x8] PHASE 1: dist_sm_i.bin 생성 + shared 저장 ===\n");
-    for(int sm=0; sm<NUM_SM; sm++){
-        if(fork()==0){
-            make_dist_8x8(sm, shared, semid);
-            printf("[PH1][SM %d] dist_sm_%d.bin 생성 완료\n", sm, sm);
-            exit(0);
-        }
-    }
-    for(int i=0;i<NUM_SM;i++) wait(NULL);
-
-    /* ---------- Phase 2: ord 재정렬 + server 전송 ---------- */
-    printf("\n=== [GRID_8x8] PHASE 2: shared(dist) 기반 ord 재정렬 + server 전송 ===\n");
-    for(int sm=0; sm<NUM_SM; sm++){
-        if(fork()==0){
-            int start = sm * SM_CHUNK;            // 0,512,1024,...
-            int *ord_buf = (int*)malloc(sizeof(int)*SM_CHUNK);
-            if (!ord_buf) { perror("malloc ord_buf"); exit(1); }
-
-            /* STEP2: 전역 순서(start~start+511)를 만들되,
-               값은 "shared의 dist 결과"에서 읽어서 채운다 */
-            for(int i=0; i<SM_CHUNK; i++){
-                int global = start + i;           // 우리가 만들어야 하는 global index
-
-                int row = global / N;
-                int col = global % N;
-
-                int owner_sm  = col / 8;          // dist가 들어있는 SM
-                int owner_pos = row * 8 + (col % 8); // dist 내부 위치 (0~511)
-
-                ord_buf[i] = shared[owner_sm * 512 + owner_pos];
-            }
-
-            /* ord 파일 저장 (보여주기용) */
-            char fname[32];
-            sprintf(fname, "ord_sm_%d.bin", sm);
-            FILE *fp = fopen(fname, "wb");
-            if(fp){
-                fwrite(ord_buf, sizeof(int), SM_CHUNK, fp);
-                fclose(fp);
-            } else {
-                perror("fopen ord");
-                exit(1);
-            }
-
-            /* server 전송: 256 ints * 2 chunks */
-            int msqid = msgget(MSG_KEY, 0666);
-            if (msqid == -1) { perror("msgget(client)"); exit(1); }
-
-            struct msgbuf msg;
-            msg.mtype = sm + 1;
-
-            memcpy(msg.data, &ord_buf[0], sizeof(int)*CHUNK_INT);
-            if (msgsnd(msqid, &msg, sizeof(msg.data), 0) == -1) {
-                perror("msgsnd chunk0");
-                exit(1);
-            }
-
-            memcpy(msg.data, &ord_buf[CHUNK_INT], sizeof(int)*CHUNK_INT);
-            if (msgsnd(msqid, &msg, sizeof(msg.data), 0) == -1) {
-                perror("msgsnd chunk1");
-                exit(1);
-            }
-
-            printf("[PH2][SM %d] ord_sm_%d.bin 생성 + server 전송 완료 (global %d~%d)\n",
-                   sm, sm, start, start + SM_CHUNK - 1);
-
-            free(ord_buf);
-            exit(0);
-        }
-    }
-
-    /* Phase2 자식 대기 */
-    for(int i=0;i<NUM_SM;i++) wait(NULL);
-
-#elif defined(GRID_4x4)
-
-    /* ===== shared memory for client↔client ===== */
-    int initial_shmid = shmget(IPC_PRIVATE,
-                               sizeof(int) * DATA_SIZE,
-                               IPC_CREAT | 0666);
-    int domain_shmid  = shmget(IPC_PRIVATE,
-                               sizeof(int) * DATA_SIZE,
-                               IPC_CREAT | 0666);
-
-    int *shm_initial = shmat(initial_shmid, NULL, 0);
-    int *shm_domain  = shmat(domain_shmid, NULL, 0);
-
-    /* ===== semaphore ===== */
-    int sem_init   = semget(IPC_PRIVATE, 1, IPC_CREAT | 0666);
-    int sem_domain = semget(IPC_PRIVATE, 1, IPC_CREAT | 0666);
-
-    union semun sem_arg;
-    sem_arg.val = 0;
-    semctl(sem_init,   0, SETVAL, sem_arg);
-    semctl(sem_domain, 0, SETVAL, sem_arg);
-
-    /* ===== 8 logical clients ===== */
-    for (int l = 0; l < LOGICAL_SM; l++) {
+    printf("=== [GRID_8x8] 8 SM parallel execution ===\n\n");
+    fflush(stdout);
+    
+    /* Phase 1: dist 생성 */
+    for (i = 0; i < NUM_SM; i++) {
         if (fork() == 0) {
-
-            /* ===== STEP 1: dist 생성 ===== */
-            int dist_buf[LOGICAL_CHUNK];
-            make_dist_4x4(l, dist_buf);
-
-            char dname[32];
-            sprintf(dname, "dist_sm_%d.bin", l);
-            FILE *fd = fopen(dname, "wb");
-            fwrite(dist_buf, sizeof(int), LOGICAL_CHUNK, fd);
-            fclose(fd);
-
-            memcpy(&shm_initial[l * LOGICAL_CHUNK],
-                   dist_buf,
-                   sizeof(int) * LOGICAL_CHUNK);
-
-            sem_unlock(sem_init);
-
-            /* ===== STEP 2: domain 대기 ===== */
-            sem_lock(sem_domain);
-
-            int ord_buf[LOGICAL_CHUNK];
-            memcpy(ord_buf,
-                   &shm_domain[l * LOGICAL_CHUNK],
-                   sizeof(int) * LOGICAL_CHUNK);
-
-            char oname[32];
-            sprintf(oname, "ord_sm_%d.bin", l);
-            FILE *fo = fopen(oname, "wb");
-            fwrite(ord_buf, sizeof(int), LOGICAL_CHUNK, fo);
-            fclose(fo);
-
-            int msqid = msgget(MSG_KEY, 0666);
+            int dist_buf[512];
+            char fname[32];
+            FILE *fp;
+            
+            make_dist_8x8(i, dist_buf);
+            
+            sprintf(fname, "dist_sm_%d.bin", i);
+            fp = fopen(fname, "wb");
+            fwrite(dist_buf, sizeof(int), 512, fp);
+            fclose(fp);
+            
+            sem_wait_s(semid);
+            memcpy(&shared[i * 512], dist_buf, sizeof(int) * 512);
+            sem_post_s(semid);
+            
+            exit(0);
+        }
+    }
+    for (i = 0; i < NUM_SM; i++) wait(NULL);
+    printf("[Phase 1] dist 생성 완료\n\n");
+    fflush(stdout);
+    
+    /* Phase 2 & 3: 재정렬 + 전송 */
+    counters[0] = counters[1] = counters[2] = 0;
+    
+    for (i = 0; i < NUM_SM; i++) {
+        if (fork() == 0) {
+            int sm = i;
+            int start = sm * SM_CHUNK;
+            int ord_buf[SM_CHUNK];
+            int j, global, row, col, owner_sm, owner_pos;
+            char fname[32];
+            FILE *fp;
+            int msqid;
             struct msgbuf msg;
-            msg.mtype = l + 1;
-
+            
+            /* Signal ready */
+            sem_wait_s(sem_ready);
+            counters[0]++;
+            sem_post_s(sem_ready);
+            
+            /* Wait for GO (client-client) */
+            sem_wait_s(sem_go_cc);
+            
+            /* Client-Client: 재정렬 */
+            for (j = 0; j < SM_CHUNK; j++) {
+                global = start + j;
+                row = global / N;
+                col = global % N;
+                owner_sm = col / 8;
+                owner_pos = row * 8 + (col % 8);
+                ord_buf[j] = shared[owner_sm * 512 + owner_pos];
+            }
+            
+            sprintf(fname, "ord_sm_%d.bin", sm);
+            fp = fopen(fname, "wb");
+            fwrite(ord_buf, sizeof(int), SM_CHUNK, fp);
+            fclose(fp);
+            
+            /* Signal done (client-client) */
+            sem_wait_s(sem_done_cc);
+            counters[1]++;
+            sem_post_s(sem_done_cc);
+            
+            /* Wait for GO (client-server) */
+            sem_wait_s(sem_go_cs);
+            
+            /* Client-Server: msgsnd */
+            msqid = msgget(MSG_KEY, 0666);
+            msg.mtype = sm + 1;
+            
             memcpy(msg.data, &ord_buf[0], sizeof(int) * CHUNK_INT);
             msgsnd(msqid, &msg, sizeof(msg.data), 0);
-
+            
             memcpy(msg.data, &ord_buf[CHUNK_INT], sizeof(int) * CHUNK_INT);
             msgsnd(msqid, &msg, sizeof(msg.data), 0);
-
+            
+            /* Signal done (client-server) */
+            sem_wait_s(sem_done_cs);
+            counters[2]++;
+            sem_post_s(sem_done_cs);
+            
             exit(0);
         }
     }
-
-    /* ===== parent: client↔client redistribution ===== */
-    for (int i = 0; i < LOGICAL_SM; i++)
-        sem_lock(sem_init);
-
-    int temp[LOGICAL_SM][LOGICAL_CHUNK];
-    int count[LOGICAL_SM] = {0};
-
-    for (int i = 0; i < DATA_SIZE; i++) {
-        int v = shm_initial[i];
-        int owner = v / LOGICAL_CHUNK;
-        int pos   = count[owner]++;
-        temp[owner][pos] = v;
+    
+    /* Wait for ready */
+    while (1) {
+        sem_wait_s(sem_ready);
+        int r = counters[0];
+        sem_post_s(sem_ready);
+        if (r == NUM_SM) break;
+        usleep(100);
     }
-
-    for (int l = 0; l < LOGICAL_SM; l++) {
-        memcpy(&shm_domain[l * LOGICAL_CHUNK],
-               temp[l],
-               sizeof(int) * LOGICAL_CHUNK);
-        sem_unlock(sem_domain);
+    
+    /* Start client-client */
+    gettimeofday(&total_cc_s, NULL);
+    for (i = 0; i < NUM_SM; i++) sem_post_s(sem_go_cc);
+    
+    /* Wait for client-client done */
+    while (1) {
+        sem_wait_s(sem_done_cc);
+        int d = counters[1];
+        sem_post_s(sem_done_cc);
+        if (d == NUM_SM) break;
+        usleep(100);
     }
+    gettimeofday(&total_cc_e, NULL);
+    
+    /* Start client-server */
+    gettimeofday(&total_cs_s, NULL);
+    for (i = 0; i < NUM_SM; i++) sem_post_s(sem_go_cs);
+    
+    /* Wait for client-server done */
+    while (1) {
+        sem_wait_s(sem_done_cs);
+        int d = counters[2];
+        sem_post_s(sem_done_cs);
+        if (d == NUM_SM) break;
+        usleep(100);
+    }
+    gettimeofday(&total_cs_e, NULL);
+    
+    for (i = 0; i < NUM_SM; i++) wait(NULL);
 
-    for (int i = 0; i < LOGICAL_SM; i++)
-        wait(NULL);
-
+#elif defined(GRID_4x4)
+    printf("=== [GRID_4x4] 8 logical SM parallel execution ===\n\n");
+    fflush(stdout);
+    
+    {
+    int initial_shmid, domain_shmid;
+    int *shm_initial, *shm_domain;
+    int sem_dist_done, sem_redist_done, sem_go_send;
+    union semun sem_arg;
+    int l;
+    
+    initial_shmid = shmget(IPC_PRIVATE, sizeof(int) * DATA_SIZE, IPC_CREAT | 0666);
+    domain_shmid = shmget(IPC_PRIVATE, sizeof(int) * DATA_SIZE, IPC_CREAT | 0666);
+    shm_initial = shmat(initial_shmid, NULL, 0);
+    shm_domain = shmat(domain_shmid, NULL, 0);
+    
+    sem_dist_done = semget(IPC_PRIVATE, 1, IPC_CREAT | 0666);
+    sem_redist_done = semget(IPC_PRIVATE, 1, IPC_CREAT | 0666);
+    sem_go_send = semget(IPC_PRIVATE, 1, IPC_CREAT | 0666);
+    
+    sem_arg.val = 0;
+    semctl(sem_dist_done, 0, SETVAL, sem_arg);
+    semctl(sem_redist_done, 0, SETVAL, sem_arg);
+    semctl(sem_go_send, 0, SETVAL, sem_arg);
+    
+    counters[0] = counters[1] = counters[2] = 0;
+    
+    /* 8 logical clients (병렬) */
+    for (l = 0; l < LOGICAL_SM; l++) {
+        if (fork() == 0) {
+            int dist_buf[512];
+            int ord_buf[512];
+            char fname[32];
+            FILE *fp;
+            int msqid;
+            struct msgbuf msg;
+            int j, target_global, src_sm, src_pos;
+            
+            /* Phase 1: dist 생성 */
+            make_dist_4x4(l, dist_buf);
+            
+            sprintf(fname, "dist_sm_%d.bin", l);
+            fp = fopen(fname, "wb");
+            fwrite(dist_buf, sizeof(int), 512, fp);
+            fclose(fp);
+            
+            /* shared memory에 저장 */
+            sem_wait_s(semid);
+            memcpy(&shm_initial[l * 512], dist_buf, sizeof(int) * 512);
+            sem_post_s(semid);
+            
+            /* Signal dist done */
+            sem_wait_s(sem_done_cc);
+            counters[0]++;
+            sem_post_s(sem_done_cc);
+            
+            /* Wait for redistribution GO signal */
+            sem_wait_s(sem_redist_done);
+            
+            /* Phase 2: Client-Client 재정렬 (각 client가 자기 domain 데이터 수집) */
+            /* 나의 domain: global index l*512 ~ (l+1)*512 - 1 */
+            for (j = 0; j < 512; j++) {
+                target_global = l * 512 + j;
+                
+                /* 이 global index가 어느 SM의 dist에 있는지 찾기 */
+                /* 4x4 partitioning: 16x16 tile 기반 */
+                {
+                    int row = target_global / N;
+                    int col = target_global % N;
+                    int tile_row = row / 16;
+                    int tile_col = col / 16;
+                    int src_logical_sm = (tile_row % 2) * 4 + tile_col;
+                    int local_row = row % 16;
+                    int local_col = col % 16;
+                    int repeat = tile_row / 2;
+                    src_pos = repeat * 256 + local_row * 16 + local_col;
+                    src_sm = src_logical_sm;
+                }
+                
+                ord_buf[j] = shm_initial[src_sm * 512 + src_pos];
+            }
+            
+            /* Save ord file */
+            sprintf(fname, "ord_sm_%d.bin", l);
+            fp = fopen(fname, "wb");
+            fwrite(ord_buf, sizeof(int), 512, fp);
+            fclose(fp);
+            
+            /* Signal redistribution done */
+            sem_wait_s(sem_done_cs);
+            counters[1]++;
+            sem_post_s(sem_done_cs);
+            
+            /* Wait for GO to send */
+            sem_wait_s(sem_go_send);
+            
+            /* Phase 3: Client-Server 전송 */
+            msqid = msgget(MSG_KEY, 0666);
+            msg.mtype = l + 1;
+            
+            memcpy(msg.data, &ord_buf[0], sizeof(int) * CHUNK_INT);
+            msgsnd(msqid, &msg, sizeof(msg.data), 0);
+            
+            memcpy(msg.data, &ord_buf[CHUNK_INT], sizeof(int) * CHUNK_INT);
+            msgsnd(msqid, &msg, sizeof(msg.data), 0);
+            
+            /* Signal send done */
+            sem_wait_s(sem_ready);
+            counters[2]++;
+            sem_post_s(sem_ready);
+            
+            exit(0);
+        }
+    }
+    
+    /* Wait for all dist done */
+    while (1) {
+        sem_wait_s(sem_done_cc);
+        int d = counters[0];
+        sem_post_s(sem_done_cc);
+        if (d == LOGICAL_SM) break;
+        usleep(100);
+    }
+    printf("[Phase 1] dist 생성 완료\n\n");
+    fflush(stdout);
+    
+    /* Start client-client redistribution (병렬) */
+    gettimeofday(&total_cc_s, NULL);
+    for (l = 0; l < LOGICAL_SM; l++) sem_post_s(sem_redist_done);
+    
+    /* Wait for redistribution done */
+    while (1) {
+        sem_wait_s(sem_done_cs);
+        int d = counters[1];
+        sem_post_s(sem_done_cs);
+        if (d == LOGICAL_SM) break;
+        usleep(100);
+    }
+    gettimeofday(&total_cc_e, NULL);
+    
+    /* Start client-server */
+    gettimeofday(&total_cs_s, NULL);
+    for (l = 0; l < LOGICAL_SM; l++) sem_post_s(sem_go_send);
+    
+    /* Wait for send done */
+    while (1) {
+        sem_wait_s(sem_ready);
+        int d = counters[2];
+        sem_post_s(sem_ready);
+        if (d == LOGICAL_SM) break;
+        usleep(100);
+    }
+    gettimeofday(&total_cs_e, NULL);
+    
+    for (i = 0; i < LOGICAL_SM; i++) wait(NULL);
+    
     shmdt(shm_initial);
     shmdt(shm_domain);
     shmctl(initial_shmid, IPC_RMID, NULL);
     shmctl(domain_shmid, IPC_RMID, NULL);
-
+    semctl(sem_dist_done, 0, IPC_RMID);
+    semctl(sem_redist_done, 0, IPC_RMID);
+    semctl(sem_go_send, 0, IPC_RMID);
+    }
 #endif
-
-    gettimeofday(&cc_e,NULL);
-
-    printf("\n[CLIENT↔CLIENT] time = %.6f sec\n",
-           GET_DURATION(cc_s,cc_e));
-
-    wait(NULL); /* server */
-
+    
+    /* Wait for server */
+    wait(NULL);
+    
+    /* Print results */
+    printf("\n========== TIMING RESULTS ==========\n");
+    printf("[CLIENT-CLIENT] %.6f sec (shared memory 재정렬, 병렬)\n", 
+           GET_DURATION(total_cc_s, total_cc_e));
+    printf("[CLIENT-SERVER] %.6f sec (msgsnd 완료까지, 병렬)\n", 
+           GET_DURATION(total_cs_s, total_cs_e));
+    printf("[SERVER RECV]   %.6f sec (msgrcv 누적)\n", server_times[0]);
+    printf("[SERVER I/O]    %.6f sec (fwrite 누적)\n", server_times[1]);
+    
+    /* Cleanup */
     shmdt(shared);
-    shmctl(shmid,IPC_RMID,NULL);
-    semctl(semid,0,IPC_RMID);
-
+    shmdt(server_times);
+    shmdt(counters);
+    shmctl(shmid, IPC_RMID, NULL);
+    shmctl(server_time_shmid, IPC_RMID, NULL);
+    shmctl(counter_shmid, IPC_RMID, NULL);
+    semctl(semid, 0, IPC_RMID);
+    semctl(sem_ready, 0, IPC_RMID);
+    semctl(sem_go_cc, 0, IPC_RMID);
+    semctl(sem_done_cc, 0, IPC_RMID);
+    semctl(sem_go_cs, 0, IPC_RMID);
+    semctl(sem_done_cs, 0, IPC_RMID);
+    
     return 0;
 }
